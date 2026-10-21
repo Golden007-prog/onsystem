@@ -34,8 +34,11 @@ const CARD = 'export function Card(props: { children?: unknown }) { return <div 
 const INPUT = 'export function Input(props: { value?: string }) { return <input /> }\n';
 const THEME = ':root {\n  --primary: oklch(0.55 0.2 260);\n  --radius: 0.5rem;\n}\n';
 
-/** A design-system package like @northwind/ui: exports built `dist/`, sources in `src/`. */
-function northwind(files: string[]): Record<string, string> {
+/**
+ * A design-system package like @northwind/ui: exports built `dist/`, with its type declarations
+ * unless `types` is false, and sources in `src/`.
+ */
+function northwind(files: string[], types = true): Record<string, string> {
   return {
     'pnpm-workspace.yaml': 'packages:\n  - packages/*\n',
     'package.json': json({ name: 'northwind', private: true }),
@@ -44,7 +47,7 @@ function northwind(files: string[]): Record<string, string> {
       version: '1.0.0',
       files,
       exports: {
-        '.': { types: './dist/index.d.ts', import: './dist/index.mjs' },
+        '.': { ...(types ? { types: './dist/index.d.ts' } : {}), import: './dist/index.mjs' },
         './theme.css': './theme.css',
       },
     }),
@@ -73,13 +76,15 @@ function installed(pkg: string, name: string, published: string[]): string {
 
 describe('init in a design-system package tells its team what installed apps get', () => {
   it('names the component files "files" leaves out, and what apps lose without them', async () => {
-    const root = fixture(northwind(['dist', 'theme.css']));
+    // With no type declarations to read them from either (test/layered-config.test.ts has the
+    // package that publishes them).
+    const root = fixture(northwind(['dist', 'theme.css'], false));
     const ui = path.join(root, 'packages/ui');
 
     const init = await run(['init', '--yes', '--no-cache'], ui);
     expect(init.code).toBe(0);
     expect(init.stdout).toContain(
-      'Apps that install @northwind/ui from a registry get only what "files" in package.json publishes, which leaves out src/ (3 component files). Those apps do not know the components in it: they get no component, prop, variant or native-element checks, and `onsystem check --require-design-system` fails in them. Add it to "files" for them; workspace apps read the sources either way.',
+      'Apps that install @northwind/ui from a registry get only what "files" in package.json publishes, which leaves out src/ (3 component files). Those apps do not know the components in it: with no type declarations published either, they get no component, prop, variant or native-element checks, and `onsystem check --require-design-system` fails in them. Add it to "files" for them; workspace apps read the sources either way.',
     );
     const next = init.stdout.split('\n').find((line) => line.startsWith('Next:'));
     expect(next).toBe(
@@ -227,7 +232,7 @@ describe('init --force in an app that takes on a design-system package config', 
   const VARIANT =
     'no-unknown-variant: "danger" is not a valid variant for <Button>. Allowed: default, outline.';
 
-  it("writes the package's components, importPath and tokens, and says its rules no longer apply", async () => {
+  it("writes a config that builds on the package's, keeping its components, importPath, tokens and rules", async () => {
     const app = fixture({
       ...PACKAGE,
       'node_modules/@acme/kit/onsystem.config.json': json({
@@ -242,27 +247,26 @@ describe('init --force in an app that takes on a design-system package config', 
 
     const init = await run(['init', '--yes', '--force', '--no-cache'], app);
     expect(init.code).toBe(0);
-    expect(init.stdout).toContain(
-      'Found the design system through the config @acme/kit declares: node_modules/@acme/kit/src/*.tsx.',
-    );
     expect(init.stdout).not.toContain('default folders');
     expect(init.stdout).toContain(
-      "This project took on the config @acme/kit declares (node_modules/@acme/kit/onsystem.config.json); with --force it has one of its own, which is read instead, so @acme/kit's rules and later changes to its config no longer reach it.\n",
+      `This project reads the config @acme/kit declares (node_modules/@acme/kit/onsystem.config.json). With --force it has one of its own, onsystem.config.json, read over that one:`,
     );
     expect(JSON.parse(read(path.join(app, 'onsystem.config.json')))).toEqual({
       $schema: 'https://unpkg.com/onsystem/schema.json',
-      components: ['node_modules/@acme/kit/src/*.tsx'],
-      importPath: '@acme/kit',
-      tokens: ['node_modules/@acme/kit/theme.css'],
     });
     // The app's own config still checks the package's components where they are imported.
     fs.rmSync(path.join(app, 'onsystem.baseline.json'));
     expect(await findings(app)).toContain(VARIANT);
+    const config = await loadConfig({ root: app });
+    expect(config.components).toEqual(['node_modules/@acme/kit/src/*.tsx']);
+    expect(config.importPath).toBe('@acme/kit');
+    expect(config.tokens.map((t) => t.path)).toEqual(['node_modules/@acme/kit/theme.css']);
+    expect(config.rules['no-hardcoded-spacing'].severity).toBe('error');
   });
 
-  it("says when the config it writes does not know the package's components", async () => {
+  it("keeps the components zero config reads through the package's config, which a copy could not name", async () => {
     // The package's config leaves its components to zero config, which reads an installed
-    // package only through a config it declares.
+    // package named otherwise only through a config it declares.
     const app = fixture({
       ...PACKAGE,
       'node_modules/@acme/kit/package.json': json({
@@ -285,9 +289,9 @@ describe('init --force in an app that takes on a design-system package config', 
     const init = await run(['init', '--yes', '--force', '--no-cache'], app);
     expect(init.code).toBe(0);
     expect(init.stdout).toContain(
-      "so @acme/kit's rules and later changes to its config no longer reach it. It does not know @acme/kit's components: delete onsystem.config.json to take on @acme/kit's config again.",
+      "still comes from @acme/kit's config, and the rules and overrides you add to it apply over @acme/kit's rules.",
     );
     fs.rmSync(path.join(app, 'onsystem.baseline.json'), { force: true });
-    expect(await findings(app)).not.toContain(VARIANT);
+    expect(await findings(app)).toContain(VARIANT);
   });
 });

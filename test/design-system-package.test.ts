@@ -107,7 +107,7 @@ describe('init in a design-system package', () => {
     );
     expect(init.stdout).toContain('Wrote onsystem.config.json, package.json, ONSYSTEM.md.');
     expect(init.stdout).toContain(
-      'A workspace app that depends on @acme/kit now finds it with no config of its own: run `npx onsystem inspect` in one to see it, and give its team ONSYSTEM.md. An app that installs @acme/kit from a registry gets no component checks until "files" publishes src/.',
+      'A workspace app that depends on @acme/kit now finds it with no config of its own: run `npx onsystem inspect` in one to see it, and give its team ONSYSTEM.md. An app that installs @acme/kit from a registry reads its components from the type declarations it publishes, not from src/.',
     );
     const manifest = read(path.join(kit, 'package.json'));
     expect(manifest.onsystem).toBe('./onsystem.config.json');
@@ -152,12 +152,14 @@ describe('init in a design-system package', () => {
     );
     expect(fs.existsSync(path.join(app, 'onsystem.config.json'))).toBe(false);
     expect(appInit.stdout).toContain('Baseline: 2 findings in 1 file → onsystem.baseline.json');
-    // --force writes the app a config of its own, which is then read instead.
+    // --force writes the app a config of its own, which builds on the package's.
     expect((await run(['init', '--yes', '--force', '--no-cache'], app)).code).toBe(0);
     expect(fs.existsSync(path.join(app, 'onsystem.config.json'))).toBe(true);
-    expect((await run(['inspect', '--no-cache'], app)).stdout).toContain(
-      'config   onsystem.config.json\n',
+    const forced = (await run(['inspect', '--no-cache'], app)).stdout;
+    expect(forced).toContain(
+      `config   onsystem.config.json, over ${path.join(kit, 'onsystem.config.json')} (declared by @acme/kit)\n`,
     );
+    expect(forced).toContain('files    3 component files, 1 token file');
   });
 
   it('keeps package.json as it is written, an ONSYSTEM.md already there, and a private package unnoted', async () => {
@@ -333,40 +335,56 @@ describe('a config a design-system package declares', () => {
     );
   });
 
-  it("gives way to the app's own config, and wins over a workspace root's, from the root too", async () => {
+  it("is read under the app's own config, and under a workspace root's from the root", async () => {
     const files = {
       ...MONOREPO,
       ...kitAt('packages/kit', { rules: { 'no-hardcoded-spacing': 'error' } }),
-      'onsystem.config.json': json({ rules: { 'no-hardcoded-spacing': 'off' } }),
+      'onsystem.config.json': json({
+        rules: { 'no-hardcoded-spacing': 'off', 'no-unknown-variant': 'off' },
+      }),
     };
     const root = fixture(files);
+    // From the app's folder, the root's config is not read.
     const fromApp = await loadConfig({ root: path.join(root, 'apps/web') });
     expect(fromApp.designSystemPackage?.name).toBe('@acme/kit');
+    expect(fromApp.configFile).toBe(path.join(root, 'packages/kit/onsystem.config.json'));
     expect(fromApp.rules['no-hardcoded-spacing'].severity).toBe('error');
-    // From the monorepo root, the app's project reads the same config.
+    // From the monorepo root, the app's project reads the root's config over the package's.
     const { workspace } = await loadTarget({ cwd: root });
     const project = await workspace?.projectFor('apps/web/app/page.tsx');
-    expect(project?.config.configFile).toBe(fromApp.configFile);
-    expect(project?.config.rules['no-hardcoded-spacing'].severity).toBe('error');
+    expect(project?.config.configFile).toBe(path.join(root, 'onsystem.config.json'));
+    expect(project?.config.designSystemPackage?.name).toBe('@acme/kit');
+    expect(project?.config.components).toEqual(fromApp.components);
+    expect(project?.config.rules['no-hardcoded-spacing'].severity).toBe('off');
     const atRoot = await run(['inspect', '--no-cache'], root);
     expect(atRoot.stdout).toContain(
-      `apps/web (@acme/web)\n  config     ${path.join('packages', 'kit', 'onsystem.config.json')} (declared by @acme/kit)`,
+      `apps/web (@acme/web)\n  config     onsystem.config.json, over ${path.join('packages', 'kit', 'onsystem.config.json')} (declared by @acme/kit)`,
     );
+    // check from the root reports what check in the app's folder does, but for the rule the
+    // root's config turns off.
     const checked = await run(['check', '.', '--format', 'json', '--no-cache'], root);
+    const inApp = await findings(path.join(root, 'apps/web'));
+    expect(inApp.some((f) => f.includes('no-unknown-variant'))).toBe(true);
     expect(
       (JSON.parse(checked.stdout) as Results)
         .flatMap((r) => r.diagnostics.map((d) => `${r.file} ${d.ruleId}`))
         .filter((f) => f.startsWith('apps/web/')),
     ).toEqual(
-      (await findings(path.join(root, 'apps/web'))).map((f) => `apps/web/${f}`.replace(/:.*$/, '')),
+      inApp
+        .filter((f) => !f.includes('no-unknown-variant'))
+        .map((f) => `apps/web/${f}`.replace(/:.*$/, '')),
     );
 
-    // The app's own config wins over the package's.
+    // The app's own config builds on the package's, or, with "extends": false, replaces it.
     fs.writeFileSync(path.join(root, 'apps/web/onsystem.config.json'), json({}));
     const own = await loadConfig({ root: path.join(root, 'apps/web') });
-    expect(own.designSystemPackage).toBeUndefined();
+    expect(own.designSystemPackage?.name).toBe('@acme/kit');
     expect(own.configFile).toBe(path.join(root, 'apps/web/onsystem.config.json'));
-    expect(own.rules['no-hardcoded-spacing'].severity).toBe('warn');
+    expect(own.rules['no-hardcoded-spacing'].severity).toBe('error');
+    fs.writeFileSync(path.join(root, 'apps/web/onsystem.config.json'), json({ extends: false }));
+    const alone = await loadConfig({ root: path.join(root, 'apps/web') });
+    expect(alone.designSystemPackage).toBeUndefined();
+    expect(alone.rules['no-hardcoded-spacing'].severity).toBe('warn');
   });
 
   it('is an error when the package names one that cannot be read, a config in code among them', async () => {

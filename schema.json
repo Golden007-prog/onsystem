@@ -7,6 +7,10 @@
     "$schema": {
       "type": "string"
     },
+    "extends": {
+      "description": "Whether this config builds on the one a design-system package declares (\"onsystem\" in the package.json of a dependency): what it leaves out comes from there (components with their importPath, docs and elements; tokens; libraries), and its rules apply over the package's. Default: true. false reads this config alone.",
+      "type": "boolean"
+    },
     "components": {
       "description": "Globs for component source files, relative to the root.",
       "anyOf": [
@@ -103,7 +107,7 @@
       "type": "string"
     },
     "importPath": {
-      "description": "Package name components are imported from, e.g. \"@acme/ui\", or a pattern for packages imported by path: \"@acme/ui/{path}\" is @acme/ui/primitives/button for primitives/button.tsx in the package. Default: inferred from package exports and tsconfig paths.",
+      "description": "Package name components are imported from, e.g. \"@acme/ui\", or a pattern for packages imported by path: \"@acme/ui/{path}\" is @acme/ui/primitives/button for primitives/button.tsx in the package. An installed dependency it names exactly, whose component sources the project does not read, is read from its type declarations (.d.ts). Default: inferred from package exports and tsconfig paths.",
       "type": "string"
     },
     "elements": {

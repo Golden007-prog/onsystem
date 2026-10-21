@@ -1,28 +1,31 @@
 import { describe, expect, it } from 'vitest';
 
 import { main, type Io } from '../src/cli.js';
-import { fixture } from './helpers.js';
+import { fixture, TSCONFIG } from './helpers.js';
 
-// An app that installs a design-system package published as compiled `dist/` alone, whose config
-// sets `importPath`, as `init` writes it for a package apps import by one name. The app's model
-// has no components, so `check` says the component rules did not run; they must not then report
-// every component the app imports from the package as one the design system does not have.
+// An app that installs a design-system package published as compiled `dist/` alone, without type
+// declarations, whose config sets `importPath`, as `init` writes it for a package apps import by
+// one name. The app's model has no components, so `check` says the component rules did not run;
+// they must not then report every component the app imports from the package as one the design
+// system does not have. With type declarations, its components are read from them.
 
 const json = (value: unknown) => JSON.stringify(value, null, 2);
 
 const THEME =
   '@theme {\n  --spacing: 0.25rem;\n  --color-primary: oklch(0.55 0.2 260);\n  --radius-md: 0.375rem;\n}\n';
 
-/** `@acme/ui` as npm publishes it: `dist/`, the tokens and `init`'s config, but no `src/`. */
+/**
+ * `@acme/ui` as npm publishes it: `dist/`, the tokens and `init`'s config, but no `src/`, and no
+ * type declarations.
+ */
 const DIST_ONLY = {
   'package.json': json({
     name: '@acme/ui',
     version: '1.0.0',
     files: ['dist', 'theme.css', 'onsystem.config.json'],
     main: './dist/index.js',
-    types: './dist/index.d.ts',
     exports: {
-      '.': { types: './dist/index.d.ts', import: './dist/index.js' },
+      '.': { import: './dist/index.js' },
       './theme.css': './theme.css',
     },
     onsystem: './onsystem.config.json',
@@ -35,11 +38,27 @@ const DIST_ONLY = {
   'theme.css': THEME,
   'dist/index.js':
     'export function Button() {}\nexport function Card() {}\nexport function Input() {}\nexport function ChevronLeft() {}\n',
+};
+
+/** The same package with the type declarations tsc emits for it, named in its package.json. */
+const WITH_DECLARATIONS = {
+  ...DIST_ONLY,
+  'package.json': json({
+    ...(JSON.parse(DIST_ONLY['package.json']) as Record<string, unknown>),
+    types: './dist/index.d.ts',
+    exports: {
+      '.': { types: './dist/index.d.ts', import: './dist/index.js' },
+      './theme.css': './theme.css',
+    },
+  }),
   'dist/index.d.ts': [
-    'export declare function Button(props: { variant?: "default" | "outline" }): unknown;',
-    'export declare function Card(props: object): unknown;',
-    'export declare function Input(props: object): unknown;',
-    'export declare function ChevronLeft(props: object): unknown;',
+    "import * as react from 'react';",
+    "import * as react_jsx_runtime from 'react/jsx-runtime';",
+    'declare function Button(props: react.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "default" | "outline" }): react_jsx_runtime.JSX.Element;',
+    'declare function Card(props: react.HTMLAttributes<HTMLDivElement>): react_jsx_runtime.JSX.Element;',
+    'declare function Input(props: react.InputHTMLAttributes<HTMLInputElement>): react_jsx_runtime.JSX.Element;',
+    'declare function ChevronLeft(props: react.SVGProps<SVGSVGElement>): react_jsx_runtime.JSX.Element;',
+    'export { Button, Card, ChevronLeft, Input };',
     '',
   ].join('\n'),
 };
@@ -82,15 +101,27 @@ const COMPONENT_RULES = [
 
 const NOTICE = 'No design-system components found: the component rules did not run.';
 
-function installedApp(pkg: Record<string, string>, extra: Record<string, string> = {}): string {
-  return fixture({
-    'package.json': json({ name: 'web', dependencies: { '@acme/ui': '1.0.0' } }),
-    'app/page.tsx': PAGE,
-    ...Object.fromEntries(
-      Object.entries(pkg).map(([file, text]) => [`node_modules/@acme/ui/${file}`, text]),
-    ),
-    ...extra,
-  });
+/** An app that installs `pkg` as `@acme/ui`; with `react`, React's types are installed too. */
+function installedApp(
+  pkg: Record<string, string>,
+  extra: Record<string, string> = {},
+  react = false,
+): string {
+  return fixture(
+    {
+      'package.json': json({
+        name: 'web',
+        dependencies: { '@acme/ui': '1.0.0', ...(react ? { react: '19.0.0' } : {}) },
+      }),
+      ...(react ? { 'tsconfig.json': TSCONFIG } : {}),
+      'app/page.tsx': PAGE,
+      ...Object.fromEntries(
+        Object.entries(pkg).map(([file, text]) => [`node_modules/@acme/ui/${file}`, text]),
+      ),
+      ...extra,
+    },
+    { nodeModules: react },
+  );
 }
 
 type Results = { diagnostics: { ruleId: string; line: number; message: string }[] }[];
@@ -136,21 +167,26 @@ describe('an app on a design-system package published without its sources', () =
     ]);
   });
 
-  it('still checks the components when the package publishes their sources', async () => {
-    const { findings, stderr } = await check(installedApp(WITH_SOURCES));
-    expect(stderr).not.toContain(NOTICE);
-    const components = findings
-      .filter((d) => COMPONENT_RULES.includes(d.ruleId))
-      .map((d) => [d.ruleId, d.line, d.message.split(/[.(]/)[0]?.trim()]);
-    expect(components).toEqual(
-      expect.arrayContaining([
-        ['no-unknown-variant', 8, '"danger" is not a valid variant for <Button>'],
-        ['no-unknown-prop', 8, '<Button> has no prop "tone"'],
-        ['no-unknown-component', 10, '"Badge" is not a design-system component'],
-      ]),
-    );
-    expect(components.filter(([, , message]) => /"(?:Button|Card)"/.test(String(message)))).toEqual(
-      [],
-    );
-  });
+  for (const [what, pkg, react] of [
+    ['their sources', WITH_SOURCES, false],
+    ['their type declarations', WITH_DECLARATIONS, true],
+  ] as const) {
+    it(`still checks the components when the package publishes ${what}`, async () => {
+      const { findings, stderr } = await check(installedApp(pkg, {}, react));
+      expect(stderr).not.toContain(NOTICE);
+      const components = findings
+        .filter((d) => COMPONENT_RULES.includes(d.ruleId))
+        .map((d) => [d.ruleId, d.line, d.message.split(/[.(]/)[0]?.trim()]);
+      expect(components).toEqual(
+        expect.arrayContaining([
+          ['no-unknown-variant', 8, '"danger" is not a valid variant for <Button>'],
+          ['no-unknown-prop', 8, '<Button> has no prop "tone"'],
+          ['no-unknown-component', 10, '"Badge" is not a design-system component'],
+        ]),
+      );
+      expect(
+        components.filter(([, , message]) => /"(?:Button|Card)"/.test(String(message))),
+      ).toEqual([]);
+    });
+  }
 });

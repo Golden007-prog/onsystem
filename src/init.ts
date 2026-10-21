@@ -67,7 +67,8 @@ export const GUIDE_FILE = 'ONSYSTEM.md';
  * (`"onsystem": "./onsystem.config.json"`, and in `files` when the package lists them), so
  * every app that depends on the package reads it, and writes ONSYSTEM.md, which tells those
  * apps' teams how to add the agent tools and the CI check. In an app that takes on such a
- * package's config, it writes no config of its own unless --force says to.
+ * package's config, it writes no config of its own unless --force says to, and then one that
+ * builds on the package's, for the app's own rules and overrides.
  *
  * In a terminal, it offers to add a short section on onsystem to the project's AGENTS.md or
  * CLAUDE.md, for coding agents.
@@ -114,28 +115,35 @@ export async function init(
   const relative = (abs: string) => relativePath(root, abs);
   // An app on a design-system package that declares its config needs none of its own.
   const inherited = options.force ? undefined : config.designSystemPackage;
-  // With --force, the config written here is read instead of the package's.
+  // With --force, the config written here builds on the package's.
   const replaced = options.force ? config.designSystemPackage : undefined;
   // "components" holds what zero config found, not globs the user gave.
   let found = false;
   if (inherited) {
     notes.push(
-      `This project takes on the config ${inherited.name} declares in its package.json (${relativePath(io.cwd, inherited.config) || inherited.config}), so it needs none of its own; nothing was written. Pass --force to write one, which is read instead.`,
+      `This project takes on the config ${inherited.name} declares in its package.json (${relativePath(io.cwd, inherited.config) || inherited.config}), so it needs none of its own; nothing was written. Pass --force to write one for its own rules and overrides, which builds on ${inherited.name}'s.`,
     );
   } else if (configOptions.components?.length) {
     file.components = configOptions.components;
     if (configOptions.tokens?.length) file.tokens = configOptions.tokens;
     if (configOptions.docs?.length) file.docs = configOptions.docs;
+  } else if (replaced) {
+    // What the config leaves out comes from the package's, as it does with none: it holds only
+    // the app's own rules and overrides, once they are added.
   } else if (workspace) {
     // At a monorepo root, each project keeps zero config; the file holds what they share.
     notes.push(
-      `This is a monorepo root: ${workspace.projects.length} of ${workspace.projects.length + workspace.others.length} workspace packages have a design system (${workspace.projects.map((p) => p.dir).join(', ') || 'none'}). Each keeps zero config; rules and overrides you add here apply to every project without a config of its own.`,
+      `This is a monorepo root: ${workspace.projects.length} of ${workspace.projects.length + workspace.others.length} workspace packages have a design system (${workspace.projects.map((p) => p.dir).join(', ') || 'none'}). Each keeps zero config; rules and overrides you add here apply to every project without a config of its own when it is checked from this folder, over the config its design-system package declares.`,
     );
   } else if (config.detected) {
     notes.push(`Found the design system through ${config.detected}.`);
     const specifiers = new Set((config.imports ?? []).map((m) => m.specifier));
     const tokens = (await tokenFiles(config)).map(relative);
-    if (specifiers.size > 1) {
+    const fromInstalled = installedFields(config.components, tokens);
+    if (fromInstalled.length) notes.push(installedNote(fromInstalled));
+    if (fromInstalled.includes('components')) {
+      // Spelled out, they would miss the package's next version.
+    } else if (specifiers.size > 1) {
       notes.push(
         `"components" is left to zero config: apps import them by ${specifiers.size} specifiers from the package's exports (${[...specifiers].slice(0, 2).join(', ')}, …), which a config cannot spell.`,
       );
@@ -154,27 +162,21 @@ export async function init(
       const docs = config.docs.filter((d) => !DEFAULT_DOCS.includes(d));
       if (docs.length) file.docs = [...DEFAULT_DOCS, ...docs];
     }
-    if (tokens.length) file.tokens = tokens;
+    if (tokens.length && !fromInstalled.includes('tokens')) file.tokens = tokens;
   } else if ((await componentFiles(config)).length) {
     // Nothing detected, but the default folders hold components (`components/ui` without a
     // components.json), as `check` and `inspect` find them: spell out the ones that match.
-    // With --force in an app, they are the folders a design-system package's config names.
-    const declared = replaced && config.configured;
     const matching: string[] = [];
     for (const glob of config.components) {
       if ((await componentFiles({ ...config, components: [glob] })).length) matching.push(glob);
     }
-    notes.push(
-      declared
-        ? `Found the design system through the config ${replaced.name} declares: ${matching.join(', ')}.`
-        : `Found the design system in the default folders: ${matching.join(', ')}.`,
-    );
+    notes.push(`Found the design system in the default folders: ${matching.join(', ')}.`);
     file.components = matching;
     found = true;
-    // Imported as the package's config says, not by a path into it.
-    if (declared && config.importPath) file.importPath = config.importPath;
     const tokens = (await tokenFiles(config)).map(relative);
-    if (tokens.length) file.tokens = tokens;
+    const fromInstalled = installedFields([], tokens);
+    if (fromInstalled.length) notes.push(installedNote(fromInstalled));
+    else if (tokens.length) file.tokens = tokens;
   } else {
     if (!ask) {
       io.stderr(
@@ -223,11 +225,7 @@ export async function init(
     fs.writeFileSync(out, `${JSON.stringify(file, null, 2)}\n`);
     written.push(CONFIG_FILE);
   }
-  if (replaced) {
-    // What the project reads now, next to what it took on.
-    const own = (await loadTarget({ ...configOptions, config: undefined })).config;
-    notes.push(await replacedNote(replaced, config, own, io.cwd));
-  }
+  if (replaced) notes.push(replacedNote(replaced, io.cwd));
   let registry: Unshipped | undefined;
   if (designSystem && manifest && name) {
     written.push(...declarePackage(root, manifest, name, options.force, notes));
@@ -530,7 +528,8 @@ interface Unshipped {
  * files its `files` list leaves out of the published package, and those outside the package
  * (`../tailwind-config/theme.css`), which an installed package's config cannot reach. Undefined
  * for a private package, or when they find every file. Without a `files` list, npm publishes
- * everything in the package.
+ * everything in the package. Without any component file, those apps read the components from
+ * the type declarations the package publishes, when it names some.
  */
 async function unshipped(
   config: ResolvedConfig,
@@ -547,10 +546,12 @@ async function unshipped(
     files ? list.filter((f) => !outside(f) && !ships(files, f)) : [];
   const missing = { components: left(components), tokens: left(tokens) };
   const away = { components: components.filter(outside), tokens: tokens.filter(outside) };
-  // With every component file left out, the component rules know no component in those apps.
+  // With every component file left out, those apps read the components from the package's type
+  // declarations, or, when it publishes none, know no component.
   const noComponents =
     components.length > 0 &&
     missing.components.length + away.components.length === components.length;
+  const declarations = noComponents ? publishedDeclarations(config.root, json, files) : [];
   // `(3 component files and 1 token file). Those apps do not know the components or tokens in it…`
   const lost = (lists: { components: string[]; tokens: string[] }, one: boolean) => {
     const c = lists.components.length;
@@ -559,12 +560,16 @@ async function unshipped(
       ...(c ? [count(c, 'component file')] : []),
       ...(t ? [count(t, 'token file')] : []),
     ]);
+    const them = one ? 'it' : 'them';
+    if (c && noComponents && declarations.length) {
+      return `(${kinds}). Those apps read the components from the type declarations it publishes instead (${andList(declarations)})${t ? `, and do not know the tokens in ${them}` : ''}.`;
+    }
     const what = andList([...(c ? ['components'] : []), ...(t ? ['tokens'] : [])], 'or');
     const checks =
       c && noComponents
-        ? `: they get no component, prop, variant or native-element checks, and \`${NAME} check --require-design-system\` fails in them`
+        ? `: with no type declarations published either, they get no component, prop, variant or native-element checks, and \`${NAME} check --require-design-system\` fails in them`
         : '';
-    return `(${kinds}). Those apps do not know the ${what} in ${one ? 'it' : 'them'}${checks}.`;
+    return `(${kinds}). Those apps do not know the ${what} in ${them}${checks}.`;
   };
 
   const notes: string[] = [];
@@ -588,50 +593,79 @@ async function unshipped(
     notes,
     next:
       noComponents && missing.components.length
-        ? `gets no component checks until "files" publishes ${andList([...new Set(missing.components.map(top))])}`
+        ? declarations.length
+          ? `reads its components from the type declarations it publishes, not from ${andList([...new Set(missing.components.map(top))])}`
+          : `gets no component checks until "files" publishes ${andList([...new Set(missing.components.map(top))])}`
         : `does not read ${andList([...folders, ...beyond])}`,
   };
 }
 
 /**
- * Said when --force writes a config in an app that took on a design-system package's: the new
- * one is read instead, and what it does not take from the package. `taken` is the config the
- * app took on, `own` the one it reads now.
+ * The type declarations a package's package.json names, as apps that install it look for them:
+ * `types` or `typings`, a `types` condition in its `exports`, or an `index.d.ts` beside it, each
+ * that its `files` list publishes. Relative to the package.
  */
-async function replacedNote(
-  pkg: DesignSystemPackage,
-  taken: ResolvedConfig,
-  own: ResolvedConfig,
-  cwd: string,
-): Promise<string> {
-  const lacks = async (list: (c: ResolvedConfig) => Promise<string[]>) => {
-    const kept = new Set((await list(own)).map((f) => path.resolve(f)));
-    return (await list(taken)).some((f) => !kept.has(path.resolve(f)));
+function publishedDeclarations(
+  root: string,
+  json: Record<string, unknown>,
+  files: readonly unknown[] | undefined,
+): string[] {
+  const named: string[] = [];
+  for (const field of ['types', 'typings']) {
+    const value = json[field];
+    if (typeof value === 'string') named.push(value);
+  }
+  const conditions = (value: unknown, key?: string): void => {
+    if (typeof value === 'string') {
+      if (key === 'types') named.push(value);
+    } else if (Array.isArray(value)) {
+      for (const item of value) conditions(item);
+    } else if (value && typeof value === 'object') {
+      for (const [k, v] of Object.entries(value)) conditions(v, k);
+    }
   };
-  const components = await lacks(componentFiles);
-  const importPath = taken.importPath !== undefined && own.importPath === undefined;
-  const tokens = await lacks(tokenFiles);
+  conditions(json.exports);
+  if (fs.existsSync(path.join(root, 'index.d.ts'))) named.push('index.d.ts');
+  return [...new Set(named.map((f) => f.replace(/^\.\//, '')))].filter(
+    (f) => !files || ships(files, f),
+  );
+}
+
+/**
+ * Said when --force writes a config in an app on a design-system package that declares one: the
+ * new config builds on the package's, which still gives it what it leaves out.
+ */
+function replacedNote(pkg: DesignSystemPackage, cwd: string): string {
   const declared = relativePath(cwd, pkg.config) || pkg.config;
-  const replaced = `This project took on the config ${pkg.name} declares (${declared}); with --force it has one of its own, which is read instead, so ${pkg.name}'s rules and later changes to its config no longer reach it.`;
-  if (!components && !importPath && !tokens) return replaced;
-  const effects = andList([
-    ...(components ? [`does not know ${pkg.name}'s components`] : []),
-    ...(importPath && !components
-      ? [`does not match imports from ${pkg.name} to its components`]
-      : []),
-    ...(tokens ? [`does not read ${pkg.name}'s tokens`] : []),
-  ]);
-  // What the package's config spells out can be copied; what zero config found there cannot.
-  const fields = [
-    ...(components ? ['"components"'] : []),
-    ...(importPath || (components && taken.importPath !== undefined) ? ['"importPath"'] : []),
-    ...(tokens ? ['"tokens"'] : []),
+  return `This project reads the config ${pkg.name} declares (${declared}). With --force it has one of its own, ${CONFIG_FILE}, read over that one: what it leaves out, such as "components", "importPath" and "tokens", still comes from ${pkg.name}'s config, and the rules and overrides you add to it apply over ${pkg.name}'s rules. "extends": false in it reads it alone.`;
+}
+
+/** Whether a path, relative to the root, is in a package installed in `node_modules`. */
+const isInstalledPath = (file: string) => /(?:^|\/)node_modules\//.test(file);
+
+/**
+ * The fields `init` leaves to zero config because what zero config found for them is in a
+ * package installed in `node_modules`: `components` (their globs) and `tokens` (files).
+ */
+function installedFields(
+  components: readonly string[],
+  tokens: readonly string[],
+): ('components' | 'tokens')[] {
+  return [
+    ...(components.some(isInstalledPath) ? ['components' as const] : []),
+    ...(tokens.some(isInstalledPath) ? ['tokens' as const] : []),
   ];
-  const copy =
-    (!components || taken.configured === true) && (!tokens || taken.tokensDetected !== true)
-      ? `copy ${andList(fields)} from ${declared} into ${CONFIG_FILE}, or `
-      : '';
-  return `${replaced} It ${effects}: ${copy}delete ${CONFIG_FILE} to take on ${pkg.name}'s config again.`;
+}
+
+/**
+ * Why `fields` are left to zero config: a path into an installed package breaks when it is
+ * upgraded, since pnpm keeps each version in a folder of its own
+ * (`node_modules/.pnpm/@acme+ui@1.2.0_react@19.2.0/node_modules/@acme/ui`), and a list of its
+ * files misses the ones a new version adds. Zero config finds it again each time.
+ */
+function installedNote(fields: readonly string[]): string {
+  const one = fields.length === 1;
+  return `${andList(fields.map((f) => `"${f}"`))} ${one ? 'is' : 'are'} left to zero config: ${one ? 'it comes' : 'they come'} from a package installed in node_modules, which zero config finds again after each upgrade, while a path written here would break once the package's folder or files change (pnpm keeps each version in a folder of its own in node_modules/.pnpm).`;
 }
 
 const REGISTRY_DOCS = 'https://onsystem.vercel.app/docs/configuration#code-from-shadcn-registries';
@@ -807,7 +841,7 @@ function consumerGuide(name: string): string {
     `npx -y ${NAME} inspect`,
     '```',
     '',
-    `An app with an ${CONFIG_FILE} of its own reads that instead.`,
+    `An app with an ${CONFIG_FILE} of its own reads it over ${name}'s config: what it leaves out, such as the components, \`importPath\` and tokens, comes from ${name}'s, and the rules and overrides it sets apply over ${name}'s rules. \`"extends": false\` in it reads it alone.`,
     '',
     '## Coding agents',
     '',

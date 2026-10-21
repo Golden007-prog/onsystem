@@ -24,7 +24,7 @@ export function explainProject(ds: DesignSystem, cwd: string, indent = ''): stri
   }
   if (config.configured) {
     out(
-      `  components come from ${config.configFile ? display(cwd, config.configFile) : '--components'}, so zero config did not look`,
+      `  components come from ${config.configFile ? `${display(cwd, config.configFile)}${over(config, cwd)}` : '--components'}, so zero config did not look`,
     );
   } else {
     const steps: DetectionStep[] = [];
@@ -64,7 +64,7 @@ export function explainProject(ds: DesignSystem, cwd: string, indent = ''): stri
   field(
     'config',
     config.configFile
-      ? `${display(cwd, config.configFile)}${config.designSystemPackage ? ` (declared by ${config.designSystemPackage.name})` : ''}`
+      ? `${display(cwd, config.configFile)}${over(config, cwd)}${config.designSystemPackage ? ` (declared by ${config.designSystemPackage.name})` : ''}`
       : '(none)',
   );
   field('components', listOf(config.components) || '(none)');
@@ -219,18 +219,28 @@ export function nodeModulesFor(dir: string): string | undefined {
   }
 }
 
+/** `, over packages/ui/onsystem.config.json` for a config read over a design-system package's. */
+function over(config: ResolvedConfig, cwd: string): string {
+  const declared = config.designSystemPackage;
+  return declared && config.configFile !== declared.config
+    ? `, over ${display(cwd, declared.config)}`
+    : '';
+}
+
 function display(cwd: string, file: string): string {
   const rel = relativePath(cwd, file);
   return rel && !rel.startsWith('..') ? rel : file;
 }
 
 /**
- * Whether a dependency's declared config was taken on, for a project without a config of its
- * own: the package it came from and the others that declare one, or that none does.
+ * Whether a dependency's declared config was read, taken on by a project without a config of its
+ * own or under the one it has: the package it came from and the others that declare one, or that
+ * none does.
  */
 function packageSteps(config: ResolvedConfig, cwd: string): DetectionStep[] {
   const declared = config.designSystemPackage;
-  // A config of its own (or --config) is read first; the dependencies are not looked at.
+  // A config of its own (or --config) read alone: no dependency declares one, or it sets
+  // `"extends": false`.
   if (config.configFile && !declared) return [];
   const lookup = findDesignSystemPackage(config.root);
   if (!lookup) return [];
@@ -251,7 +261,7 @@ function packageSteps(config: ResolvedConfig, cwd: string): DetectionStep[] {
     {
       candidate,
       accepted: true,
-      reason: `${declared.name} (${declared.installed ? 'installed' : 'a workspace package'}) declares ${display(cwd, declared.config)}, which this project takes on, with its paths from ${display(cwd, declared.dir)}${lookup.others.length ? `; ${lookup.others.join(', ')} also declare one, not read: one config is taken on, from the package the code imports most` : ''}${skipped}`,
+      reason: `${declared.name} (${declared.installed ? 'installed' : 'a workspace package'}) declares ${display(cwd, declared.config)}, which this project ${config.configFile === declared.config ? 'takes on' : `reads under ${display(cwd, config.configFile ?? '')}`}, with its paths from ${display(cwd, declared.dir)}${lookup.others.length ? `; ${lookup.others.join(', ')} also declare one, not read: one config is taken on, from the package the code imports most` : ''}${skipped}`,
     },
   ];
 }

@@ -196,10 +196,11 @@ async function discoverWorkspace(
 }
 
 /**
- * A project's config: its own config file, else the config its design-system package declares
- * (a dependency with `"onsystem"` in its package.json), else the workspace root's, with paths
- * relative to the workspace root, else zero config. `loadConfig` from the project's folder finds
- * the first two the same way. CLI flags that apply to every project carry over.
+ * A project's config: its own config file, else the workspace root's, with paths relative to
+ * the workspace root, read over the config its design-system package declares (a dependency with
+ * `"onsystem"` in its package.json), else zero config. `loadConfig` from the project's folder
+ * finds its own config and the package's the same way. CLI flags that apply to every project
+ * carry over.
  */
 function loadProjectConfig(
   dir: string,
@@ -219,7 +220,7 @@ function loadProjectConfig(
   }
   const lookup = findDesignSystemPackage(dir, packages);
   // A declaration that cannot be read is reported from the project's own load.
-  if (lookup?.found || lookup?.problems.length) {
+  if (lookup?.problems.length) {
     return loadConfigWith({ ...shared, root: dir }, { packages, lookup });
   }
   return loadConfigWith(

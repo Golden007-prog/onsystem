@@ -1122,7 +1122,7 @@ async function inspect(
   }
   const lines: string[] = [
     `root     ${model.root}`,
-    `config   ${config.configFile ? `${displayPath(io.cwd, config.configFile)}${declaredBy(config)}` : '(defaults)'}`,
+    `config   ${config.configFile ? `${displayPath(io.cwd, config.configFile)}${declaredBy(config, (f) => displayPath(io.cwd, f))}` : '(defaults)'}`,
     ...(config.detected ? [`detected ${config.detected}`] : []),
     ...describeLibraries(config, model, io.cwd).map((line) => `library  ${line}`),
     `files    ${plural(model.stats.files.components, 'component file')}, ${plural(model.stats.files.tokens, 'token file')}, ${plural(model.stats.files.docs, 'doc')}`,
@@ -1294,8 +1294,9 @@ async function inspectWorkspace(
     const roots = ds.roots();
     const tokens = [...tokenCounts(model)].map(([category, n]) => `${category} ${n}`);
     const own =
-      project.config.configFile && project.config.configFile !== workspace.configFile
-        ? `${displayPath(workspace.root, project.config.configFile)}${declaredBy(project.config)}`
+      project.config.configFile &&
+      (project.config.configFile !== workspace.configFile || project.config.designSystemPackage)
+        ? `${displayPath(workspace.root, project.config.configFile)}${declaredBy(project.config, (f) => displayPath(workspace.root, f))}`
         : undefined;
     lines.push(
       '',
@@ -1360,9 +1361,15 @@ function explainWorkspace(
   return lines;
 }
 
-/** ` (declared by @acme/ui)` after a config a design-system package declares; empty otherwise. */
-function declaredBy(config: ResolvedConfig): string {
-  return config.designSystemPackage ? ` (declared by ${config.designSystemPackage.name})` : '';
+/**
+ * ` (declared by @acme/ui)` after a config a design-system package declares, `, over
+ * packages/ui/onsystem.config.json (declared by @acme/ui)` after one read over it; empty otherwise.
+ */
+function declaredBy(config: ResolvedConfig, display: (file: string) => string): string {
+  const declared = config.designSystemPackage;
+  if (!declared) return '';
+  const over = config.configFile === declared.config ? '' : `, over ${display(declared.config)}`;
+  return `${over} (declared by ${declared.name})`;
 }
 
 /** `A, B, C` up to a dozen names, then `and 40 more`. */
