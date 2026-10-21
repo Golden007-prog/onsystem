@@ -1,11 +1,11 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import { glob } from 'tinyglobby';
-import type ts from 'typescript';
+import ts from 'typescript';
 
 import { loadConfig, rulesFor, type ResolvedConfig, type TokenSourceConfig } from './config.js';
 import {
@@ -15,7 +15,11 @@ import {
   workspaceRootOf,
   type DesignSystemSource,
 } from './detect.js';
-import { extractComponents } from './extract/components.js';
+import {
+  extractComponents,
+  type ExtractComponentsOptions,
+  type ExtractComponentsResult,
+} from './extract/components.js';
 import { attachDocs, parseDoc, type ParsedDoc } from './extract/docs.js';
 import {
   isProjectFile,
@@ -384,6 +388,46 @@ function repositoryOf(dir: string): string | undefined {
   }
 }
 
+/**
+ * `extractComponents`, without the component files nested too deeply for TypeScript's recursive
+ * parser (thousands of levels), each named in a warning: one such file would otherwise fail the
+ * whole design system with a RangeError that names no file.
+ */
+function extractReadable(options: ExtractComponentsOptions): ExtractComponentsResult {
+  try {
+    return extractComponents(options);
+  } catch (error) {
+    if (!isStackOverflow(error)) throw error;
+    const tooDeep = new Set(options.files.filter(overflowsParser));
+    // Too deep somewhere else, such as a module the components import: none to leave out.
+    if (!tooDeep.size) throw error;
+    const extracted = extractComponents({
+      ...options,
+      files: options.files.filter((file) => !tooDeep.has(file)),
+    });
+    for (const file of tooDeep) {
+      extracted.warnings.push(
+        `${relativePath(options.root, file)}: nested too deeply to read (thousands of levels); skipped.`,
+      );
+    }
+    return extracted;
+  }
+}
+
+/** Whether parsing `file` on its own runs out of stack. */
+function overflowsParser(file: string): boolean {
+  try {
+    ts.createSourceFile(file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.Latest);
+    return false;
+  } catch (error) {
+    return isStackOverflow(error);
+  }
+}
+
+function isStackOverflow(error: unknown): boolean {
+  return error instanceof RangeError && /call stack/i.test(error.message);
+}
+
 /** What `inspect` and the server's log say about files that lead outside the project. */
 function outsideWarning(root: string, files: readonly string[]): string {
   const shown = files.map((file) => relativePath(root, file)).sort();
@@ -576,13 +620,46 @@ async function cacheKey(
     .digest('hex');
 }
 
-function cacheFile(root: string): string {
+/**
+ * Where the model is cached: the project's `node_modules/.cache`, else (`temp`) a folder of the
+ * user's own in the system temp folder, `onsystem-<uid>`.
+ */
+function cacheFile(root: string): { file: string; temp: boolean } {
   const nodeModules = path.join(root, 'node_modules');
   if (fs.existsSync(nodeModules)) {
-    return path.join(nodeModules, '.cache', 'onsystem', 'model.json');
+    return { file: path.join(nodeModules, '.cache', 'onsystem', 'model.json'), temp: false };
   }
   const id = createHash('sha256').update(root).digest('hex').slice(0, 16);
-  return path.join(os.tmpdir(), 'onsystem', `${id}.json`);
+  const user = process.getuid ? `-${process.getuid()}` : '';
+  return { file: path.join(os.tmpdir(), `onsystem${user}`, `${id}.json`), temp: true };
+}
+
+/**
+ * Why the cache folder in the system temp folder cannot be trusted, or undefined when it can: it
+ * must be a folder, not a link, that the user owns and no one else can write to. On a multi-user
+ * host the temp folder is shared, and a model planted in it would reach the agent. With `create`,
+ * it is created (or closed) for the user first. Windows gives each user a temp folder of their own.
+ */
+async function untrustedCacheFolder(folder: string, create: boolean): Promise<string | undefined> {
+  if (!process.getuid) return undefined;
+  if (create) await fsp.mkdir(folder, { recursive: true, mode: 0o700 });
+  const stat = await fsp.lstat(folder);
+  if (!stat.isDirectory()) return `${folder} is not a folder`;
+  if (stat.uid !== process.getuid()) return `${folder} belongs to another user`;
+  if (!create && stat.mode & 0o022) return `other users can write to ${folder}`;
+  if (create && stat.mode & 0o077) await fsp.chmod(folder, 0o700);
+  return undefined;
+}
+
+/** Writes `text` beside `file`, then renames it into place: a run reading it never sees half. */
+async function writeWhole(file: string, text: string): Promise<void> {
+  const partial = `${file}.${process.pid}-${randomUUID()}.tmp`;
+  try {
+    await fsp.writeFile(partial, text, { mode: 0o600 });
+    await fsp.rename(partial, file);
+  } finally {
+    await fsp.rm(partial, { force: true });
+  }
 }
 
 export interface BuildResult {
@@ -613,12 +690,13 @@ export async function buildModel(
   const started = performance.now();
   const files = await resolveFiles(config);
   const useCache = options.cache !== false;
-  const cachePath = cacheFile(config.root);
+  const { file: cachePath, temp } = cacheFile(config.root);
 
   let cached: { key?: string; dependencies?: string[]; model?: DesignSystemModel } | undefined;
   if (useCache && !options.oldProgram) {
     try {
-      cached = JSON.parse(await fsp.readFile(cachePath, 'utf8')) as typeof cached;
+      const untrusted = temp && (await untrustedCacheFolder(path.dirname(cachePath), false));
+      if (!untrusted) cached = JSON.parse(await fsp.readFile(cachePath, 'utf8')) as typeof cached;
     } catch {
       // No cache yet, or unreadable: extract.
     }
@@ -638,7 +716,7 @@ export async function buildModel(
     return { model: cached.model, key: before, dependencies: cached.dependencies };
   }
 
-  const extracted = extractComponents({
+  const extracted = extractReadable({
     root: config.root,
     files: files.components,
     tsconfig: config.tsconfig,
@@ -715,8 +793,12 @@ export async function buildModel(
   const key = await cacheKey(config, files, dependencies, stats);
   if (useCache) {
     try {
-      await fsp.mkdir(path.dirname(cachePath), { recursive: true });
-      await fsp.writeFile(cachePath, JSON.stringify({ key, dependencies, model }));
+      const folder = path.dirname(cachePath);
+      let untrusted: string | undefined;
+      if (temp) untrusted = await untrustedCacheFolder(folder, true);
+      else await fsp.mkdir(folder, { recursive: true });
+      if (untrusted) logger.warn(`not caching the model: ${untrusted}`);
+      else await writeWhole(cachePath, JSON.stringify({ key, dependencies, model }));
     } catch (error) {
       logger.warn(`could not write cache ${cachePath}: ${(error as Error).message}`);
     }

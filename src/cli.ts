@@ -285,7 +285,10 @@ export async function main(argv: string[], io: Io = defaultIo): Promise<number> 
       io.stderr(error.message);
       return 2;
     }
-    throw error;
+    // Exit 1 means findings. A run that failed (a file it cannot read, a bug) exits 2, as a
+    // broken config does, so CI fails the job rather than taking an empty report for findings.
+    io.stderr((error as Error).stack ?? String(error));
+    return 2;
   }
 }
 

@@ -24,6 +24,7 @@ import {
 import { formatPx, lengthToPx } from '../../tokens/units.js';
 import { cssReference } from '../../tokens/usage.js';
 import type { Token } from '../../types.js';
+import { truncate } from '../../util/strings.js';
 import { attributeName, literalValues, valueBranches, type JsxNode } from '../analyze.js';
 import type { Report, Rule, RuleContext } from '../context.js';
 import { TAILWIND_KEYWORD_COLORS, TAILWIND_PALETTE } from '../tailwind-palette.js';
@@ -121,7 +122,7 @@ function maskReferencedGradientIds(elements: JsxNode[]): Set<string> {
   return ids;
 }
 
-export const noHardcodedColor: Rule = {
+export const noHardcodedColor: Rule = shortQuotes({
   id: 'no-hardcoded-color',
   description:
     'Colors must come from design tokens: no hex/rgb/oklch literals, arbitrary Tailwind colors or default-palette classes.',
@@ -375,7 +376,31 @@ export const noHardcodedColor: Rule = {
 
     reportChartTokens(context, allow);
   },
-};
+});
+
+/** The longest code a message quotes. */
+const QUOTED_CODE = 120;
+
+/**
+ * The rule, with each `code` span in its messages cut to QUOTED_CODE characters. A message quotes
+ * the class, its fix and the value whole, so one class with 33,000 `hover:` variants made a
+ * message of 400,000 characters for the agent to read.
+ */
+function shortQuotes(rule: Rule): Rule {
+  const cut = (span: string, code: string) =>
+    code.length > QUOTED_CODE ? `\`${truncate(code, QUOTED_CODE)}\`` : span;
+  return {
+    ...rule,
+    run(context) {
+      rule.run({
+        ...context,
+        report(report) {
+          context.report({ ...report, message: report.message.replace(/`([^`]+)`/g, cut) });
+        },
+      });
+    },
+  };
+}
 
 /** Packages that draw charts: Recharts, Chart.js, Nivo, visx, Victory, Tremor, MUI X Charts, D3. */
 const CHART_LIBRARY = /chart|^@nivo\/|^@visx\/|^victory|^@tremor\/|^d3(?:-|$)/i;
@@ -1181,30 +1206,76 @@ function setsColor(utility: Utility, prefix: string): boolean {
  */
 function keepStatesApart(list: readonly ListedClass[]): void {
   const after = (listed: ListedClass) => listed.report?.fix?.[0]?.text ?? listed.value;
+  const order = new Map(list.map((listed, i) => [listed, i]));
+  const parsed = new Map<string, Utility>();
+  const parse = (text: string) => {
+    let utility = parsed.get(text);
+    if (!utility) {
+      utility = parseUtility(text);
+      parsed.set(text, utility);
+    }
+    return utility;
+  };
+  // A state and its base set the same utility once fixed (`bg-primary`, with the same modifier),
+  // and classes that are the same once fixed pair alike. So the classes are kept by their text
+  // once fixed, and those texts by utility: a list of thousands is not compared pair by pair.
+  const byText = new Map<string, ListedClass[]>();
+  const byUtility = new Map<string, Set<string>>();
+  const utilityKey = (text: string) => `${parse(text).base}\0${parse(text).modifier}`;
+  const place = (listed: ListedClass) => {
+    const text = after(listed);
+    const same = byText.get(text) ?? [];
+    byText.set(text, same);
+    // In list order, the order the first match is taken in.
+    const index = order.get(listed) ?? 0;
+    same.splice(same.findLastIndex((other) => (order.get(other) ?? 0) < index) + 1, 0, listed);
+    const texts = byUtility.get(utilityKey(text)) ?? new Set();
+    byUtility.set(utilityKey(text), texts.add(text));
+  };
+  const unplace = (listed: ListedClass) => {
+    const text = after(listed);
+    const same = byText.get(text) ?? [];
+    same.splice(same.indexOf(listed), 1);
+    if (!same.length) byUtility.get(utilityKey(text))?.delete(text);
+  };
+  for (const listed of list) place(listed);
   for (const pass of ['state', 'base'] as const) {
     for (const listed of list) {
       const { report } = listed;
       if (!report?.fix?.[0]) continue;
-      for (const other of list) {
-        if (other === listed || oneColor(listed.color, other.color)) continue;
-        const [stateListed, baseListed] = pass === 'state' ? [listed, other] : [other, listed];
-        const state = parseUtility(after(stateListed));
-        const base = parseUtility(after(baseListed));
+      const text = after(listed);
+      let found: { other: ListedClass; state: Utility; conditions: string } | undefined;
+      for (const otherText of byUtility.get(utilityKey(text)) ?? []) {
+        // The same class once fixed: no condition between the two.
+        if (otherText === text) continue;
+        const [state, base] =
+          pass === 'state' ? [parse(text), parse(otherText)] : [parse(otherText), parse(text)];
         const conditions = conditionsBetween(state, base);
-        if (!conditions || hasDarkBase(list, stateListed, baseListed, state, base, after)) continue;
-        const had =
-          pass === 'base'
-            ? `\`${other.value}\` is in the class list too`
-            : after(other) === other.value
-              ? `The class list already has \`${other.value}\``
-              : `\`${other.value}\` becomes \`${after(other)}\` too`;
-        const apart = state.modifier
-          ? 'such as with another opacity modifier'
-          : `such as with \`${withBase({ ...state, modifier: '/90' }, state.base)}\``;
-        report.message += ` ${had}, so with this fix \`${conditions}\` would change nothing: it is not applied automatically. Keep the two apart, ${apart}.`;
-        report.fix = undefined;
-        break;
+        if (!conditions) continue;
+        for (const other of byText.get(otherText) ?? []) {
+          if (found && (order.get(other) ?? 0) > (order.get(found.other) ?? 0)) break;
+          if (oneColor(listed.color, other.color)) continue;
+          const [stateListed, baseListed] = pass === 'state' ? [listed, other] : [other, listed];
+          if (hasDarkBase(list, stateListed, baseListed, state, base, after)) continue;
+          found = { other, state, conditions };
+          break;
+        }
       }
+      if (!found) continue;
+      const { other, state, conditions } = found;
+      const had =
+        pass === 'base'
+          ? `\`${other.value}\` is in the class list too`
+          : after(other) === other.value
+            ? `The class list already has \`${other.value}\``
+            : `\`${other.value}\` becomes \`${after(other)}\` too`;
+      const apart = state.modifier
+        ? 'such as with another opacity modifier'
+        : `such as with \`${withBase({ ...state, modifier: '/90' }, state.base)}\``;
+      report.message += ` ${had}, so with this fix \`${conditions}\` would change nothing: it is not applied automatically. Keep the two apart, ${apart}.`;
+      unplace(listed);
+      report.fix = undefined;
+      place(listed);
     }
   }
 }
@@ -1445,7 +1516,8 @@ function scopes(
     if (name && !/^Sidebar(?:Provider|Inset)$/.test(name)) tags.push(name);
   }
   const { tokens, components } = context.target;
-  const found = scopesIn(tokens.scopedFamilies, context.file, classes, ...tags);
+  const found = scopesIn(tokens.scopedFamilies, context.file, ...tags);
+  if (classes) for (const family of classScopes(context, classes)) found.add(family);
   // Inside a component that uses a family (<CodeBlock> for syntax colors), its tokens fit.
   const files = new Set([context.file]);
   for (const tag of tags) {
@@ -1455,6 +1527,27 @@ function scopes(
   for (const family of tokens.scopedFamilies) {
     const using = tokens.familyFiles.get(family);
     if (using && [...files].some((file) => using.has(file))) found.add(family);
+  }
+  return found;
+}
+
+/** The scoped families each class string of a check names, by its text. */
+const classScopeCache = new WeakMap<RuleContext['analysis'], Map<string, Set<ScopedFamily>>>();
+
+/**
+ * The scoped families a class string names, read once per string and check: each color in it
+ * asks, and reading the whole string again for each made a list of thousands quadratic.
+ */
+function classScopes(context: RuleContext, classes: string): ReadonlySet<ScopedFamily> {
+  let cache = classScopeCache.get(context.analysis);
+  if (!cache) {
+    cache = new Map();
+    classScopeCache.set(context.analysis, cache);
+  }
+  let found = cache.get(classes);
+  if (!found) {
+    found = scopesIn(context.target.tokens.scopedFamilies, classes);
+    cache.set(classes, found);
   }
   return found;
 }
@@ -1509,7 +1602,7 @@ function numberValue(init: ts.Expression): string | undefined {
 }
 
 function lengthRule(id: Rule['id'], description: string, spec: LengthRuleSpec): Rule {
-  return {
+  return shortQuotes({
     id,
     description,
     run(context) {
@@ -1627,7 +1720,7 @@ function lengthRule(id: Rule['id'], description: string, spec: LengthRuleSpec): 
         }
       }
     },
-  };
+  });
 }
 
 /**
