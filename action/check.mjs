@@ -473,7 +473,8 @@ function summary(headline, reported) {
 /**
  * A table cell of code: a file name from the pull request, which can hold backticks, Markdown and
  * HTML. The span is fenced with more backticks than the text has in a row, so none ends it, and
- * within it nothing else is read but the table's `|`.
+ * within it nothing else is read but the table's escapes: `\|` for a `|`, and `\\` for a
+ * backslash, so a name's own backslash cannot take a `|` out of the cell (it shows doubled).
  *
  * @param {string} text
  */
@@ -481,5 +482,6 @@ function codeCell(text) {
   const runs = text.match(/`+/g) ?? [];
   const fence = '`'.repeat(Math.max(0, ...runs.map((run) => run.length)) + 1);
   const pad = runs.length ? ' ' : '';
-  return `${fence}${pad}${text.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ')}${pad}${fence}`;
+  const escaped = text.replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+  return `${fence}${pad}${escaped}${pad}${fence}`;
 }

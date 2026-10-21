@@ -63,6 +63,8 @@ describe("the Action's job summary", () => {
       .split('\n')
       .find((line) => line.startsWith('| error |'));
     expect(row).toContain('| `app/a\\|b <c> & d.tsx:2` |');
+    // A backslash before the `|` is escaped too, so the `|` stays escaped and in the cell.
+    expect(summaryFor('app/a\\|b.tsx')).toContain('| `app/a\\\\\\|b.tsx:2` |');
   });
 
   it('names an ordinary file as before', () => {
