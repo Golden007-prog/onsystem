@@ -488,10 +488,10 @@ export function Picker(props: PickerProps) {
     const client = await serve(ds);
     const result = await client.callTool({ name: 'get_component', arguments: { name: 'Picker' } });
     expect(text(result)).toContain(
-      '- actionsRef?: { current: unknown; } — A ref to imperative actions.\n',
+      '- actionsRef?: { current: unknown; } — "A ref to imperative actions."\n',
     );
     expect(text(result)).not.toContain('Useful when');
-    expect(text(result)).toContain('— Visual style. Use `subtle` inside cards.');
+    expect(text(result)).toContain('— "Visual style. Use `subtle` inside cards."');
     const { props } = result.structuredContent as {
       props: { name: string; description: string }[];
     };

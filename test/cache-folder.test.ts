@@ -46,8 +46,9 @@ function cached(): string[] {
     .filter((file) => file.endsWith('.json'));
 }
 
-async function build(root: string) {
-  return buildModel(await loadConfig({ root }));
+async function build(root: string, warnings: string[] = []) {
+  const logger = { info: () => {}, warn: (m: string) => warnings.push(m), error: () => {} };
+  return buildModel(await loadConfig({ root }), { logger });
 }
 
 function description(model: Awaited<ReturnType<typeof build>>['model']): string | undefined {
@@ -105,10 +106,29 @@ describe('the cache outside node_modules', () => {
     plant(planted);
     fs.symlinkSync(elsewhere, folder);
     const before = fs.readFileSync(planted, 'utf8');
-    const second = await build(root);
+    const warnings: string[] = [];
+    const second = await build(root, warnings);
     expect(second.model.stats.fromCache).toBe(false);
     expect(description(second.model)).toBe('Runs an action.');
     expect(fs.readFileSync(planted, 'utf8')).toBe(before);
     expect(fs.lstatSync(folder).isSymbolicLink()).toBe(true);
+    // In a shared temp folder the user may not be able to remove it: the warning says what to do.
+    expect(warnings).toEqual([
+      `not caching the model: ${folder} is not a folder. Install the project's dependencies, so the cache goes in node_modules, or set TMPDIR to a folder of your own.`,
+    ]);
+  });
+});
+
+describe('the cache in node_modules', () => {
+  it.runIf(posix)('keeps the default mode, so another user can read it', async () => {
+    // Built as one user (a Docker build as root) and read as another (CI), it is still a hit.
+    const root = fixture({ ...PROJECT, 'node_modules/.keep': '' });
+    await build(root);
+    const folder = path.join(root, 'node_modules', '.cache', 'onsystem');
+    const file = path.join(folder, 'model.json');
+    const plain = path.join(folder, 'plain.txt');
+    fs.writeFileSync(plain, '');
+    expect(fs.statSync(file).mode & 0o777).toBe(fs.statSync(plain).mode & 0o777);
+    expect(fs.readdirSync(folder).sort()).toEqual(['model.json', 'plain.txt']);
   });
 });

@@ -95,7 +95,7 @@ describe('MCP server over the in-memory transport', () => {
     const result = await client.callTool({ name: 'get_component', arguments: { name: 'button' } });
     const body = text(result);
     expect(body).toContain('import { Button } from "@/components/ui/button"');
-    expect(body).toContain('- asChild?: boolean = false — Render the child element');
+    expect(body).toContain('- asChild?: boolean = false — "Render the child element');
     expect(body).toMatch(
       /…plus \d+ props from React\.ComponentProps<"button"> \(onClick, type, disabled, form, aria-\*/,
     );
@@ -104,7 +104,7 @@ describe('MCP server over the in-memory transport', () => {
     );
     expect(body).toContain('## Variants');
     expect(body).toContain('## Docs (docs/button.md)');
-    expect(body).toContain('### Destructive action');
+    expect(body).toContain('### "Destructive action"');
     expect(result.structuredContent).toMatchObject({ name: 'Button', element: 'button' });
 
     const part = await client.callTool({

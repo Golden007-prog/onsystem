@@ -651,11 +651,15 @@ async function untrustedCacheFolder(folder: string, create: boolean): Promise<st
   return undefined;
 }
 
-/** Writes `text` beside `file`, then renames it into place: a run reading it never sees half. */
-async function writeWhole(file: string, text: string): Promise<void> {
+/**
+ * Writes `text` beside `file`, then renames it into place: a run reading it never sees half. With
+ * `own`, only the user can read it (the temp folder's cache); without, it has the default mode, so
+ * a cache in `node_modules` built by one user (a Docker build as root) is still read by another.
+ */
+async function writeWhole(file: string, text: string, own: boolean): Promise<void> {
   const partial = `${file}.${process.pid}-${randomUUID()}.tmp`;
   try {
-    await fsp.writeFile(partial, text, { mode: 0o600 });
+    await fsp.writeFile(partial, text, own ? { mode: 0o600 } : {});
     await fsp.rename(partial, file);
   } finally {
     await fsp.rm(partial, { force: true });
@@ -797,8 +801,13 @@ export async function buildModel(
       let untrusted: string | undefined;
       if (temp) untrusted = await untrustedCacheFolder(folder, true);
       else await fsp.mkdir(folder, { recursive: true });
-      if (untrusted) logger.warn(`not caching the model: ${untrusted}`);
-      else await writeWhole(cachePath, JSON.stringify({ key, dependencies, model }));
+      if (untrusted) {
+        logger.warn(
+          `not caching the model: ${untrusted}. Install the project's dependencies, so the cache goes in node_modules, or set TMPDIR to a folder of your own.`,
+        );
+      } else {
+        await writeWhole(cachePath, JSON.stringify({ key, dependencies, model }), temp);
+      }
     } catch (error) {
       logger.warn(`could not write cache ${cachePath}: ${(error as Error).message}`);
     }

@@ -63,7 +63,9 @@ describe("the Action's job summary", () => {
       .split('\n')
       .find((line) => line.startsWith('| error |'));
     expect(row).toContain('| `app/a\\|b <c> & d.tsx:2` |');
-    // A backslash before the `|` is escaped too, so the `|` stays escaped and in the cell.
+    // A backslash before the `|` is escaped too, so the `|` stays escaped and in the cell. The
+    // trade-off: a name's own backslash shows doubled in the summary. Paths are written with
+    // forward slashes, so a Windows path has none.
     expect(summaryFor('app/a\\|b.tsx')).toContain('| `app/a\\\\\\|b.tsx:2` |');
   });
 
