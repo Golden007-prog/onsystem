@@ -61,7 +61,7 @@ import path from 'node:path';
 
 const PACKAGE = 'onsystem';
 // The exact release this plugin runs; scripts/sync-versions.mjs sets it with each release.
-const VERSION = '0.9.0';
+const VERSION = '0.9.1';
 const UI_FILE = /\.[jt]sx$/i;
 const MAX_FINDINGS = 30;
 // Both runs together, within the 60 seconds hooks.json gives the hook. Tests shorten it.
